@@ -1,0 +1,3 @@
+pytorch
+pyg
+numpy
