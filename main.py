@@ -1,56 +1,61 @@
+from enum import nonmember
+
 import torch
 import time
 import os
-from pprint import pprint
+import sys
+import threading
+from typing import Any, Tuple
 from torch_geometric.data import OnDiskDataset, DataLoader
+from torch_geometric.transforms import LineGraph
+from torch_geometric.loader import DataLoader
 from src.GraphDataset import GraphDataset
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from src.utils import pretty_time_delta
 from itertools import islice, batched
 
-
-def generate_chunks(data, size):
-    chunk_list = []
-    for i in range(0, len(data), size):
-        chunk_list.append(data[i:i+size])
-    return chunk_list
-
-
 if __name__ == '__main__':
+
+    if sys._is_gil_enabled():
+        print("GIL is enabled (not free-threaded).")
+    else:
+        print("GIL is disabled (free-threaded).")
+
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    print(device)
 
     dataset = GraphDataset()
     print(dataset)
 
     start = time.time()
-    chunk_size = 5000
-
-    #graphs = dataset.multi_get(range(0, 1000))
     graphs = dataset.get_all_snapshots()
+    #graphs = dataset.get_snapshot_batches(50000)
+    results = []
+    transform = LineGraph().to(device)
 
-    graphs = generate_chunks(graphs, chunk_size)
-    print(f'Graph data split into {len(graphs)} chunks of size {chunk_size}')
+    loader = DataLoader(graphs, batch_size=10000, pin_memory=True if device == 'cuda' else False)
 
-    with ProcessPoolExecutor() as pool:
-        futures = {pool.submit(dataset.convert_to_line_graph, chunk):i for i, chunk in enumerate(graphs)}
+    count = 0
+    for batch in loader:
 
-        for future in as_completed(futures):
-            chunk_index = futures[future]
-            try:
-                results, start_worker, end_worker = future.result()
-                print(f'Chunk {chunk_index} completed in {pretty_time_delta(end_worker - start_worker)}')
-            except Exception as e:
-                print(f'Chunk {chunk_index} generated an exception: {e}')
 
-    print(len(list(results)))
+        if count % 20000 == 0:
+            print(f'{count * 20000} completed ...')
+        results.append(
+
+    print(len(results))
+    print(f'All batches completed in {pretty_time_delta(time.time() - start)}')
+
+    '''
+    with ThreadPoolExecutor(max_workers=os.cpu_count()) as pool:
+
+        results = pool.map(transform, graphs)
+    
+
+    results = list(results)
+    print(len(results))
+    print('Line Graphs: ', results[0:25])
     print(f'All batches completed in {pretty_time_delta(time.time() - start)}')
     '''
-    for batch in batched(graphs, 1000):
-        batch = dataset.convert_to_line_graph(batch)
-        print(*batch[-5:], sep='\n')
-        print('\n\n')
-    '''
-
-    #graphs = dataset.convert_to_line_graph(graphs[0:5000])
-    #print(*graphs[:-100], sep='\n')
 
 

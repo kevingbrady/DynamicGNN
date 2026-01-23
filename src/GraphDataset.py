@@ -14,6 +14,7 @@ import lzma
 import pickle
 import time
 
+
 class GraphDataset(Dataset):
 
     def __init__(self, transform=None, pre_transform=None):
@@ -71,7 +72,7 @@ class GraphDataset(Dataset):
 
         results = []
         starting_index = -1
-        ending_index = indices[-1]
+        ending_index = (indices[-1] + 1, indices[-1])[indices[-1] + 1 >= self.total_graph_snapshots]
 
         for row in dataset:
             #print(row[0], starting_index, ending_index, row[4], row[5], len(results))
@@ -91,9 +92,19 @@ class GraphDataset(Dataset):
                 if ending_index < row[5]:
                     return results[:-(row[5] - ending_index)]
 
-    def get_all_snapshots(self, batch_size: Optional[int] = 50000):
-
+    def get_all_snapshots(self):
         return self.multi_get(range(0, self.total_graph_snapshots))
+
+    def get_snapshot_batches(self, batch_size: Optional[int] = 10000):
+
+        for chunk in range(0, self.total_graph_snapshots, batch_size):
+
+            if chunk + batch_size > self.total_graph_snapshots:
+                end = self.total_graph_snapshots
+            else:
+                end = chunk + batch_size
+
+            yield self.multi_get(range(chunk, end))
 
     def check_index_valid(self, idx: int) -> bool:
         if idx < 0:
@@ -110,16 +121,6 @@ class GraphDataset(Dataset):
         step = 1 if indices.step is None else indices.step
 
         return range(start, stop, step)
-
-    @staticmethod
-    def convert_to_line_graph(graphs):
-
-        start = time.time()
-        transform = LineGraph()
-        batch = [transform(x) for x in graphs]
-        end = time.time()
-
-        return batch, start, end
 
     @staticmethod
     def serialize(data: [BaseData, float, str]) -> (int, Any, float, str):
