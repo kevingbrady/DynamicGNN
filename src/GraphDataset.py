@@ -1,119 +1,91 @@
-import os
 from typing import Any, Union, List, Tuple, Sequence, Optional, Generator
-
 from torch import Tensor
 from torch_geometric.data import Dataset, Data
-from src.DatabaseConnection import DatabaseConnection
+from src.DatabaseConnection import DatabaseAPI
 from src.utils import pretty_time_delta
-from torch_geometric.transforms import LineGraph
-from torch_geometric.data import Data
-from torch_geometric.data.data import BaseData
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from src.timing import timeit
 from typing import Any
 
+import os
 import lzma
 import pickle
 import time
+import logging
 
 
 class GraphDataset(Dataset):
+
+    transform = None
 
     def __init__(self, transform=None, pre_transform=None):
 
         super().__init__('', transform, pre_transform)
 
-        self.transform = transform
-        self.db = 'NetworkIntrusionDetectionDB'
-        self.db_full_path = '/home/kgb/PycharmProjects/PcapPreprocessor/NetworkIntrusionDetectionDB'
+        self.db = 'NetworkIntrusionDetection'
+        self.db_full_path = '/home/kgb/PycharmProjects/PcapPreprocessor/NetworkIntrusionDetection'
         self.db_table_name = 'GraphDataset'
-        self.db_columns = {'serialized_graph_list': 'BLOB', 'graph_count': 'INT', 'timestamp': 'FLOAT',
-                           'filename': 'TEXT'}
+        self.db_columns = {
+            'graph': 'BLOB',
+            'nodes': 'INT',
+            'edges': 'INT',
+            'timestamp': 'REAL',
+            'filename': 'TEXT'
+        }
 
-        self.conn = self.connect()
-        self.total_graph_snapshots = self.conn.execute_query(f"SELECT SUM(graph_count) FROM {self.db_table_name}")[0][0]
+        self.api = DatabaseAPI(self.db_full_path + '/processed/sqlite.db')
+        self.total_graph_snapshots = self.api.execute_read(f"SELECT COUNT(graph) FROM {self.db_table_name}")[0][0]
 
-    def connect(self) -> DatabaseConnection:
-        return DatabaseConnection(self.db_full_path + '/processed/sqlite.db')
-    
-    def get(self, idx: int) -> Data | None:
+        self.transform = transform
 
-        if self.check_index_valid(idx) is False:
-            return None
+    def load_graph(self, row: Any) -> Data:
 
-        query = (f'SELECT rowid, serialized_graph_list, timestamp, filename, graph_count, SUM(graph_count) '
-                 f'OVER (ORDER BY rowid, graph_count) FROM {self.db_table_name}')
-        results = self.conn.execute_query(query)
+        data = self.deserialize(row)
 
-        for row in results:
-            # print(row)
-            if idx < row[5]:
-                result = (row[1], row[4], row[2], row[3])
-                return GraphDataset.deserialize(result)['graph_list'][idx - (row[5] - row[4])]
+        if self.transform and data.num_edges > 0:
+            data = self.transform(data)
 
-    def multi_get(
-            self,
-            indices: Union[Sequence[int], Tensor, slice, range],
-            batch_size: Optional[int] = 0,
-    ) -> list[Any] | Generator[list[Any], Any, None]:
+        return data
+
+    def get(self, idx: int) -> Data:
+
+        query = f'SELECT * FROM {self.db_table_name} WHERE rowid = {idx + 1}'
+        return self.load_graph(self.api.execute_read(query))
+
+    def multi_get(self, indices: Union[Sequence[int], Tensor, slice, range], batch_size: Optional[int] = 0
+                  ) -> None | list[Data] | Generator[list[Data], Data, None]:
 
         if isinstance(indices, slice):
             indices = self.slice_to_range(indices)
         elif isinstance(indices, Tensor):
             indices = indices.tolist()
 
-        if self.check_index_valid(indices[0]) is False:
+        if not self.check_index_valid(indices[0]) or not self.check_index_valid(indices[-1]):
             return None
 
-        if self.check_index_valid(indices[-1]) is False:
-            return None
+        start = time.time()
 
-        query = (f'SELECT rowid, serialized_graph_list, timestamp, filename, graph_count, SUM(graph_count) '
-                 f'OVER (ORDER BY rowid, graph_count) FROM {self.db_table_name}')
-        dataset = self.conn.execute_query(query)
+        query = f'SELECT * FROM {self.db_table_name} WHERE rowid IN {tuple([(x + 1) for x in indices])}'
+        serialized_graphs = sorted(self.api.execute_read(query), key=lambda row: row[3])
+        logging.info(f'Fetched [{len(serialized_graphs)}] rows from database and sorted (by timestamp) in {pretty_time_delta(time.time() - start)}')
 
-        results = []
-        starting_index = -1
-        ending_index = (indices[-1] + 1, indices[-1])[indices[-1] + 1 >= self.total_graph_snapshots]
+        with ThreadPoolExecutor(max_workers=os.cpu_count() + 1) as pool:
 
-        for row in dataset:
-            #print(row[0], starting_index, ending_index, row[4], row[5], len(results))
-            if indices[0] < row[5]:
-                if starting_index == -1:
-                    #print(f'Starting index found at {indices[0] - (row[5] - row[4])} in row {row[0]}')
-                    starting_index = indices[0] - (row[5] - row[4])
+            results = [future for future in pool.map(self.load_graph, serialized_graphs)]
 
-            if starting_index != -1:
-                row_data = GraphDataset.deserialize((row[1], row[4], row[2], row[3]))
+        logging.info(f'Deserialized and transformed [{len(results)}] graphs in {pretty_time_delta(time.time() - start)}')
+        return results
 
-                if not results:
-                    results += row_data['graph_list'][starting_index:]
-                else:
-                    results += row_data['graph_list']
-
-                if ending_index < row[5]:
-                    return results[:-(row[5] - ending_index)]
-
-    def get_all_snapshots(self):
+    def get_all_snapshots(self) -> None | list[Data]:
         return self.multi_get(range(0, self.total_graph_snapshots))
 
-    def get_snapshot_batches(self, batch_size: Optional[int] = 10000):
-
-        for chunk in range(0, self.total_graph_snapshots, batch_size):
-
-            if chunk + batch_size > self.total_graph_snapshots:
-                end = self.total_graph_snapshots
-            else:
-                end = chunk + batch_size
-
-            yield self.multi_get(range(chunk, end))
-
     def check_index_valid(self, idx: int) -> bool:
-        if idx < 0:
+
+        if idx < 0 or idx > self.total_graph_snapshots:
             print(f'Index {idx} is invalid ...')
             return False
 
-        if idx > self.total_graph_snapshots:
-            print(f'Index {idx} not found in dataset ...')
-            return False
+        return True
 
     def slice_to_range(self, indices: slice) -> range:
         start = 0 if indices.start is None else indices.start
@@ -123,18 +95,13 @@ class GraphDataset(Dataset):
         return range(start, stop, step)
 
     @staticmethod
-    def serialize(data: [BaseData, float, str]) -> (int, Any, float, str):
-        return lzma.compress(pickle.dumps(data['graph'])), float(data['timestamp']), data['filename']
+    def serialize(graph: Data, filename: str) -> tuple[Any, int, int, float, str]:
+        serialized_graph = lzma.compress(pickle.dumps(graph))
+        return serialized_graph, graph.num_nodes, graph.num_edges, graph.timestamp, filename
 
     @staticmethod
-    def deserialize(row: (Any, int, float, str)) -> [list, int, float, str]:
-
-        return {
-            'graph_list': pickle.loads(lzma.decompress(row[0])),
-            'graph_count': int(row[1]),
-            'timestamp': float(row[2]),
-            'filename': row[3]
-        }
+    def deserialize(row: tuple[Any, int, int, float, str]) -> Data:
+        return pickle.loads(lzma.decompress(row[0]))
 
     def __repr__(self):
 

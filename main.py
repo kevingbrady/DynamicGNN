@@ -1,20 +1,18 @@
-from enum import nonmember
-
 import torch
 import time
 import os
 import sys
-import threading
-from typing import Any, Tuple
-from torch_geometric.data import OnDiskDataset, DataLoader
+import logging
 from torch_geometric.transforms import LineGraph
 from torch_geometric.loader import DataLoader
 from src.GraphDataset import GraphDataset
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from src.GCN import GCN
 from src.utils import pretty_time_delta
-from itertools import islice, batched
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 if __name__ == '__main__':
+
 
     if sys._is_gil_enabled():
         print("GIL is enabled (not free-threaded).")
@@ -24,38 +22,22 @@ if __name__ == '__main__':
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     print(device)
 
-    dataset = GraphDataset()
+
+    dataset = GraphDataset(transform=LineGraph(force_directed=False))
     print(dataset)
 
-    start = time.time()
-    graphs = dataset.get_all_snapshots()
-    #graphs = dataset.get_snapshot_batches(50000)
-    results = []
-    transform = LineGraph().to(device)
+    results = dataset.get_all_snapshots()
 
-    loader = DataLoader(graphs, batch_size=10000, pin_memory=True if device == 'cuda' else False)
-
-    count = 0
-    for batch in loader:
+    model = GCN(dataset.num_node_features, dataset.num_classes).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=5e-4)
+    model.train()
 
 
-        if count % 20000 == 0:
-            print(f'{count * 20000} completed ...')
-        results.append(
 
-    print(len(results))
-    print(f'All batches completed in {pretty_time_delta(time.time() - start)}')
+    #print(len(results))
+    print(*results[-50:], sep='\n')
 
-    '''
-    with ThreadPoolExecutor(max_workers=os.cpu_count()) as pool:
 
-        results = pool.map(transform, graphs)
-    
 
-    results = list(results)
-    print(len(results))
-    print('Line Graphs: ', results[0:25])
-    print(f'All batches completed in {pretty_time_delta(time.time() - start)}')
-    '''
 
 
