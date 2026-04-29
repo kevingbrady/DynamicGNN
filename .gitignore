@@ -2,3 +2,5 @@
 pyproject.toml
 uv.lock
 .venv/
+mamba/
+torch_compile_debug/

@@ -1,3 +1,4 @@
+import torch
 import numpy as np
 import numpy.typing as npt
 
@@ -63,20 +64,21 @@ def otsu_threshold(arr: npt.NDArray) -> float:
 
 
 
-def calculate_metrics(y_hat: npt.NDArray, y: npt.NDArray, threshold: float=0.5) -> tuple[float, float, float]:
+def calculate_metrics(y_hat: torch.Tensor, y: torch.Tensor, threshold: float=0.5) -> tuple[float, float, float]:
 
     #optimal_threshold = otsu_threshold(y_hat)
     #print(optimal_threshold)
-    y_hat = np.where(y_hat >= threshold, 1, 0)
+    y_hat = torch.where(y_hat >= threshold, 1, 0)
 
-    TP = np.sum((y_hat == 1) & (y == 1))
-    FP = np.sum((y_hat == 1) & (y == 0))
-    TN = np.sum((y_hat == 0) & (y == 0))
-    FN = np.sum((y_hat == 0) & (y == 1))
+    TP = torch.sum((y_hat == 1) & (y == 1))
+    FP = torch.sum((y_hat == 1) & (y == 0))
+    TN = torch.sum((y_hat == 0) & (y == 0))
+    FN = torch.sum((y_hat == 0) & (y == 1))
 
-    print(f'true positive: {TP}, true negative {TN}, false positive: {FP}, false negative: {FN}')
+    #print(f'true positive: {TP}, true negative {TN}, false positive: {FP}, false negative: {FN}')
 
     # Calculate metrics
+
     accuracy = (TP + TN) / (TP + TN + FP + FN) if (TP + TN + FP + FN) > 0 else 0
     precision = TP / (TP + FP) if (TP + FP) > 0 else 0
     recall = TP / (TP + FN) if (TP + FN) > 0 else 0

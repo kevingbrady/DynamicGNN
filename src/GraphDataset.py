@@ -1,12 +1,12 @@
+import threading
 from typing import Any, Union, List, Tuple, Sequence, Optional, Generator
-
 import torch
 from torch.utils.data import IterableDataset
 from torch_geometric.data import Dataset, Data, Batch
+from torch_geometric.utils import to_dense_batch, to_dense_adj
 from torch_geometric.transforms import LineGraph
 from torch import Tensor
 from torch_geometric.profile import get_data_size
-from torch_geometric_temporal.signal import DynamicGraphTemporalSignalBatch
 from src.DatabaseConnection import DatabaseAPI
 from src.data_columns import columns
 from src.utils import pretty_time_delta
@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 import os
+import queue
 import lzma
 import pickle
 import time
@@ -23,15 +24,13 @@ import numpy as np
 
 class GraphDataset(IterableDataset):
 
-    transform = None
-
-    def __init__(self, transform=None, pre_transform=None, free_memory_bytes=0):
+    def __init__(self, transform=None, pre_transform=None):
 
         super().__init__()   #'', transform, pre_transform)
 
         self.db = 'NetworkIntrusionDetection'
         self.db_full_path = '/home/kgb/PycharmProjects/PcapPreprocessor/NetworkIntrusionDetection'
-        self.db_table_name = 'GraphDataset'
+        self.db_table_name = 'SparseGraphDataset'
         self.db_columns = {
             'graph': 'BLOB',
             'nodes': 'INT',
@@ -42,40 +41,39 @@ class GraphDataset(IterableDataset):
 
         self.api = DatabaseAPI(self.db_full_path + '/processed/sqlite.db')
         self.graphs = []
-        self.total_graph_snapshots = self.api.execute_read(f"SELECT COUNT(graph) FROM {self.db_table_name}")[0][0]
+        self.total_graph_snapshots = 0   #self.api.execute_read(f"SELECT COUNT(graph) FROM {self.db_table_name}")[0][0]
         self.graph_features = list(columns.keys())
         self.transform = transform
-        self.free_gpu_memory = free_memory_bytes
+        self.free_gpu_memory = 0
+        self.total_gpu_memory = 0
+        self.task_queue = queue.SimpleQueue()
+        self.batch_size = 600
 
     def __iter__(self):
 
-        batch = []
-        current_batch_memory = 0
-        max_batch_size = 600
-        generator = False
+        data_fetch_thread = threading.Thread(target=self.get_all_snapshots, kwargs={'max_sequence_size':600, 'shuffle':False})
+        data_fetch_thread.start()
 
-        #if len(self.graphs) == 0:
-        iterator = self.get_all_snapshots()
-        #generator = True
-        #else:
-            #iterator = self.graphs
+        for sequence in iter(self.task_queue.get, -1):
 
-        for graph in iterator:
-            #print(max_batch_size, graph)
-            #if generator:
-                #self.graphs.append(graph)
+            batch = []
+            current_batch_memory = 0
+           
+            for future in sequence:
 
-            graph_memory = get_data_size(graph)
+                graph = future.result()
+                graph_memory = get_data_size(graph)
 
-            if current_batch_memory + graph_memory > (self.free_gpu_memory * 256) or len(batch) == max_batch_size:
-                yield batch
-                batch = []
-                current_batch_memory = 0
+                if current_batch_memory + graph_memory > self.free_gpu_memory:
+                    yield self.create_batch(batch), len(sequence)
+                    batch = []
+                    current_batch_memory = 0
 
-            batch.append(graph)
-            current_batch_memory += graph_memory
+                batch.append(graph)
+                current_batch_memory += graph_memory
 
-        yield batch
+            yield self.create_batch(batch), len(sequence)
+
 
     def __len__(self) -> int:
         return self.total_graph_snapshots
@@ -83,7 +81,7 @@ class GraphDataset(IterableDataset):
 
     def __getitem__(self, idx: int) -> Data:
 
-        return self.graphs[idx]
+        return self.load_graph(self.fetch(idx))
 
 
     def fetch(self, idx: int) -> list[tuple]:
@@ -99,6 +97,9 @@ class GraphDataset(IterableDataset):
         elif isinstance(indices, Tensor):
             indices = indices.tolist()
 
+        if not indices:
+            return None
+
         if not self.check_index_valid(indices[0]) or not self.check_index_valid(indices[-1]):
             return None
 
@@ -110,66 +111,52 @@ class GraphDataset(IterableDataset):
 
         return serialized_graphs
 
-    def get_random_sequences(self, max_sequence_size=600):
-        filenames = self.api.execute_read(f'SELECT DISTINCT filename FROM {self.db_table_name}')
+    def get_sequences(self, max_sequence_size: int=600) -> list[tuple]:
+
+        file_capture_info = self.api.execute_read(f'SELECT filename, MIN(rowid) as row_min, MAX(rowid) as row_max FROM {self.db_table_name} GROUP BY filename ORDER BY row_min')
         indices = []
+        self.total_graph_snapshots = 0
 
-        for filename in filenames:
+        for filename, row_min, row_max in file_capture_info:
 
-            row_min = self.api.execute_read(f"SELECT MIN(rowid) FROM {self.db_table_name} WHERE filename='{filename[0]}'")[0][0]
-            row_max = self.api.execute_read(f"SELECT MAX(rowid) FROM {self.db_table_name} WHERE filename='{filename[0]}'")[0][0]
+            start = row_min
+            end = row_max
+            #print(start, end, filename)
 
-            if row_max - row_min <= max_sequence_size:
-                indices.append(tuple([row_min, row_max]))
-            else:
-                row_indices = range(row_min, row_max, max_sequence_size)
-                for value in row_indices:
-                    if value + max_sequence_size < row_max:
-                        indices.append(tuple([value, value+max_sequence_size-1]))
+            while True:
+                if start != row_min:
+                    start += 1
+                if end - start <= max_sequence_size:
 
-                    else:
-                        indices.append(tuple([value, row_max]))
+                    indices.append((start, end))
+                    break
+                else:
+                    indices.append((start, start+max_sequence_size))
+                    #print(indices[-1], filename)
+                    start+=max_sequence_size
 
-        return np.random.permutation(indices)
+        for a, b in indices:
+            #print(a, b, (b+1)-a)
+            self.total_graph_snapshots += (b+1)-a
 
-    def get_snapshot_sequences_shuffled(self):
+        return indices
 
-        indices = self.get_random_sequences()
+    def get_all_snapshots(self, max_sequence_size: int, shuffle: bool=False) -> None:
+
+        indices = self.get_sequences(max_sequence_size=max_sequence_size)
+
+        if shuffle:
+            np.random.shuffle(indices)
 
         with ThreadPoolExecutor(max_workers=os.cpu_count() + 1) as pool:
-            futures = []
+
             for start, end in indices:
+                futures = []
                 for i in self.multi_get(range(start, end)):
                     futures.append(pool.submit(self.load_graph, i))
-
-            for future in futures:
-                graph = future.result()
-                print(end-start, graph)
-                if graph is not None:
-                    yield graph, end-start
-
-
-
-
-    def get_all_snapshots(self) -> Generator[Batch, Any, None] | None:
-
-        start = time.time()
-        max_batch_size = 600
-
-        with ThreadPoolExecutor(max_workers=os.cpu_count() + 1) as pool:
-
-            futures = []
-
-            for i in self.multi_get(range(0, self.total_graph_snapshots)):
-                futures.append(pool.submit(self.load_graph, i))
-
-            for future in futures:
-                graph = future.result()
-
-                if graph is not None:
-                    yield graph
-
-            logging.debug(f'Deserialized and transformed [{len(futures)}] graphs in {pretty_time_delta(time.time() - start)}')
+                    #self.load_graph(i)
+                self.task_queue.put(futures)
+            self.task_queue.put(-1)
 
     def check_index_valid(self, idx: int) -> bool:
 
@@ -186,17 +173,26 @@ class GraphDataset(IterableDataset):
 
         return range(start, stop, step)
 
+    def create_batch(self, graph_list: list[Data], dense_batch=False) -> Batch:
+
+        '''batch_vector = []
+        for idx, graph in enumerate(graph_list):
+            batch_vector.extend([str(idx)]*graph.num_nodes)'''
+
+
+        batch = Batch.from_data_list(graph_list)   #, follow_batch=batch_vector)
+
+        return batch
 
     def load_graph(self, row: Any) -> Data | None:
 
         data, num_nodes, num_edges, timestamp, filename = self.deserialize(row)
-
-        if num_edges == 0 and num_nodes == 0:
-            return None
+        #if not data.validate():
+        #    print('Invalid')
+        #    return None
 
         if self.transform:
             data = self.transform(data)
-            data.y = data.y.unsqueeze(1)
 
         return data
 
